@@ -119,9 +119,8 @@ local function scanPlasmaStock()
   return volumes, dominantPlasma, highestVolume
 end
 
-drawStaticFrame()
-
 while true do
+  drawStaticFrame()
   local plasmaVolumes, dominant, dominantVolume = scanPlasmaStock()
   updateDashboard(plasmaVolumes, dominant, dominantVolume)
 
