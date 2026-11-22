@@ -550,35 +550,62 @@ local function drawModulePanel()
   for r = row, H do gpu.fill(P1 + 1, r, PW, 1, " ") end
 end
 
+-- Keep a copy of the dust panel's last rendered lines.  A periodic full
+-- erase made lower entries visibly flicker as the panel grew longer.
+local lastDustLines = {}
 local function drawDustPanel()
-  local row = 6
-  for r = 6, H do gpu.fill(P2 + 1, r, PW, 1, " ") end  -- wipe column first
-  local list = {}
+  local list, nextLines = {}, {}
   for _, cond in ipairs(config.conditions) do
-    local name  = cond.itemName
+    local name = cond.itemName
     local stock = (brokerState.dust[name] and brokerState.dust[name].stock) or 0
     local ratio = stock / cond.amountToMaintain
-    list[#list+1] = { name=name, stock=stock, threshold=cond.amountToMaintain, ratio=ratio }
+    list[#list + 1] = {
+      name = name, stock = stock,
+      threshold = cond.amountToMaintain, ratio = ratio
+    }
   end
-  table.sort(list, function(a, b) return a.ratio < b.ratio end)
+  -- Break equal-ratio ties consistently so rows don't swap unnecessarily.
+  table.sort(list, function(a, b)
+    if a.ratio == b.ratio then return a.name < b.name end
+    return a.ratio < b.ratio
+  end)
+
+  local row = 6
   for _, item in ipairs(list) do
     if row > H then break end
-    gpu.fill(P2 + 1, row, PW, 1, " "); term.setCursor(P2 + 1, row)
     local pct = math.floor(item.ratio * 100)
-    local color = (item.ratio >= 1.0) and 0x446644 or (item.ratio < 0.25) and 0xFF4444
-                  or (item.ratio < 0.75) and 0xFFAA00 or 0x00FFFF
+    local color = (item.ratio >= 1.0) and 0x446644
+               or (item.ratio < 0.25) and 0xFF4444
+               or (item.ratio < 0.75) and 0xFFAA00 or 0x00FFFF
     local mark = item.ratio < 1.0 and "!" or " "
-    gpu.setForeground(color)
-    io.write(string.format("  %s %-27s %3d%%", mark, item.name, pct))
+    nextLines[row] = {
+      text = string.format("  %s %-27s %3d%%", mark, item.name, pct),
+      color = color
+    }
     row = row + 1
     if row > H then break end
-    gpu.fill(P2 + 1, row, PW, 1, " "); term.setCursor(P2 + 1, row)
-    gpu.setForeground(0x666666)
-    io.write(string.format("      %s / %s", formatQty(item.stock), formatQty(item.threshold)))
+    nextLines[row] = {
+      text = string.format("      %s / %s", formatQty(item.stock), formatQty(item.threshold)),
+      color = 0x666666
+    }
     row = row + 1
   end
-  for r = row, H do gpu.fill(P2 + 1, r, PW, 1, " ") end
+
+  gpu.setBackground(0x000000)
+  local blank = string.rep(" ", PW)
+  for r = 6, H do
+    local line = nextLines[r]
+    local text = line and line.text:sub(1, PW) or ""
+    local color = line and line.color or 0x666666
+    local last = lastDustLines[r]
+    if not last or last.text ~= text or last.color ~= color then
+      gpu.setForeground(color)
+      gpu.set(P2 + 1, r, (text .. blank):sub(1, PW))
+      lastDustLines[r] = { text = text, color = color }
+    end
+  end
 end
+
 
 local function drawHWPanel()
   local row = 6
