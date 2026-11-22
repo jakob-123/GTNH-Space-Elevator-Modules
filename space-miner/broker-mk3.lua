@@ -469,16 +469,77 @@ end
 -- TELEMETRY
 -- =============================================================================
 
-local function processMessage(evType, _, _, _, _, rawMsg)
-  if evType ~= "modem_message" then return end
+-- MEDINA_BROKER_DUST_CONFIG: broker is the only owner of dust targets.
+-- The dust relay requests and receives these over the wireless telemetry port.
+local dustTargetEntries = {}
+for _, cond in ipairs(config.conditions) do
+  assert(type(cond.itemName) == "string" and cond.itemName ~= "",
+    "Dust target name is missing")
+  assert(type(cond.amountToMaintain) == "number" and cond.amountToMaintain > 0,
+    "Invalid dust target quantity for " .. cond.itemName)
+  dustTargetEntries[#dustTargetEntries + 1] = {
+    name = cond.itemName, threshold = cond.amountToMaintain
+  }
+end
+
+-- Keep in sync with the dust-node protocol: the broker generates the ID and
+-- the dust node echoes it to prevent old/mismatched readings being accepted.
+local function dustTargetsId(entries)
+  local h = 5381
+  for _, entry in ipairs(entries) do
+    local value = entry.name .. ":" .. tostring(entry.threshold) .. ";"
+    for i = 1, #value do
+      h = (h * 33 + value:byte(i)) % 2147483647
+    end
+  end
+  return tostring(h)
+end
+local activeDustConfigId = dustTargetsId(dustTargetEntries)
+
+local function broadcastDustTargets()
+  modem.broadcast(config.ports.telemetry, serial.serialize({
+    protocol = "MEDINA_TELEMETRY",
+    sender = "MEDINA-BrokerMK3",
+    payloadType = "DUST_TARGETS",
+    configId = activeDustConfigId,
+    data = dustTargetEntries
+  }))
+end
+
+local function processMessage(evType, _, _, port, _, rawMsg)
+  if evType ~= "modem_message" or port ~= config.ports.telemetry
+      or type(rawMsg) ~= "string" then return end
   local ok, msg = pcall(serial.unserialize, rawMsg)
-  if not ok or type(msg) ~= "table" then return end
-  if msg.protocol ~= "MEDINA_TELEMETRY" or not msg.data then return end
+  if not ok or type(msg) ~= "table" or msg.protocol ~= "MEDINA_TELEMETRY" then return end
+
+  -- The dust node can reboot at any time without having a local config.lua.
+  if msg.payloadType == "DUST_TARGETS_REQUEST" then
+    broadcastDustTargets()
+    return
+  end
+  if type(msg.data) ~= "table" then return end
 
   if msg.payloadType == "DUST_UPDATE" then
-    for name, entry in pairs(msg.data) do
-      brokerState.dust[name] = { stock = entry.stock or 0, threshold = entry.threshold or 0 }
+    -- A scan from a different configuration must not change broker decisions.
+    if msg.configId ~= activeDustConfigId then return end
+
+    -- Check ALL configured items before updating ANY stock values: a broken,
+    -- partial, or failed scan must not be reported as zero or fresh telemetry.
+    for _, cond in ipairs(config.conditions) do
+      local entry = msg.data[cond.itemName]
+      if type(entry) ~= "table" or type(entry.stock) ~= "number"
+          or entry.stock < 0 or entry.stock ~= entry.stock
+          or entry.stock == math.huge then
+        return
+      end
     end
+    for _, cond in ipairs(config.conditions) do
+      brokerState.dust[cond.itemName] = {
+        stock = msg.data[cond.itemName].stock,
+        threshold = cond.amountToMaintain
+      }
+    end
+    brokerState.lastDustSyncUptime = computer.uptime()
     brokerState.lastDustSyncTime = os.time()
     brokerState.lastDustSync = os.date("%X")
   elseif msg.payloadType == "FLUID_UPDATE" and msg.data.plasmas then
@@ -929,7 +990,16 @@ end
 local UI_INTERVAL = 0.25          -- seconds between full UI repaints
 local lastUIDraw  = 0
 
+-- Broadcast on startup, periodically, and in response to dust-node requests.
+-- Updating config.lua on the broker requires restarting this broker program.
+broadcastDustTargets()
+local nextDustTargetsBroadcast = computer.uptime() + 15
+
 while true do
+  if computer.uptime() >= nextDustTargetsBroadcast then
+    broadcastDustTargets()
+    nextDustTargetsBroadcast = computer.uptime() + 15
+  end
   -- 1. Service one inbound message. Very short timeout: returns immediately if a
   --    message is waiting, otherwise yields the CPU for ~10ms and comes back so
   --    the scheduler keeps ticking fast.
@@ -962,7 +1032,10 @@ while true do
 
   -- 5. Dispatch on its own cadence.
   local now = os.time()
-  if brokerState.telemetryReady and (now - lastDispatchCheck >= DISPATCH_INTERVAL) then
+  if brokerState.telemetryReady
+      and brokerState.lastDustSyncUptime
+      and computer.uptime() - brokerState.lastDustSyncUptime < 35
+      and (now - lastDispatchCheck >= DISPATCH_INTERVAL) then
     dispatchBatch()
     lastDispatchCheck = now
   end
