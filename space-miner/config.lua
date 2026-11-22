@@ -678,7 +678,7 @@ config.dustTargets = {
   ["Phosphate Dust"]           = { asteroid="Phosphate",           priority=1 },
   ["Quartz Dust"]              = { asteroid="Quartz",              priority=1 },
   ["Salt"]                = { asteroid="Salt",                priority=1 },
-  ["Silicon Dust"]             = { asteroid="Silicon",             priority=1 },
+  ["Raw Silicon Dust"]             = { asteroid="Silicon",             priority=1 },
   ["Thaumium Dust"]            = { asteroid="Thaumium Dusts",      priority=1 },
   ["Tungsten Dust"]            = { asteroid="Tungsten-Titanium",   priority=1 },
   ["Manganese Dust"]           = { asteroid="Tungsten-Titanium",   priority=2 },
@@ -704,9 +704,9 @@ config.dustTargets = {
   ["Uranium 238 Dust"]         = { asteroid="Uranium-Plutonium",   priority=1 },
   ["Plutonium 239 Dust"]       = { asteroid="Uranium-Plutonium",   priority=3 },
   ["Thorium Dust"]             = { asteroid="Uranium-Plutonium",   priority=4 },
-  ["Naquadah Dust"]            = { asteroid="Naquadah",            priority=1 },
-  ["Enriched Naquadah Dust"]   = { asteroid="Naquadah",            priority=2 },
-  ["Naquadria Dust"]           = { asteroid="Naquadah",            priority=3 }
+  ["Naquadah Oxide Mixture Dust"]            = { asteroid="Naquadah",            priority=1 },
+  ["Enriched-Naquadah Oxide Mixture Dust"]   = { asteroid="Naquadah",            priority=2 },
+  ["Naquadria Oxide Mixture Dust"]           = { asteroid="Naquadah",            priority=3 }
 }
 
 --------------------------------------------------------------------------------
@@ -743,12 +743,12 @@ config.conditions = {
 --  { itemName="Ichorium Dust",           amountToMaintain=qty("5k")   },
 --  { itemName="Draconic Core Dust",      amountToMaintain=qty("5k")   },
 --  { itemName="Tengam Dust",             amountToMaintain=qty("2m") },  -- Requires MK-III modules
-  { itemName="Mysterious Crystal Dust", amountToMaintain=qty("10m")  },
+  { itemName="Mysterious Crystal Dust", amountToMaintain=qty("1m")  },
   { itemName="Cosmic Neutronium Dust",  amountToMaintain=qty("10m")  },
 --  { itemName="Trinium Dust",            amountToMaintain=qty("10m")  },
 --  { itemName="Adamantium Dust",         amountToMaintain=qty("15m")  },
-  { itemName="Ledox Dust",              amountToMaintain=qty("10m") },
-  { itemName="Callisto Ice Dust",       amountToMaintain=qty("10m")  },
+  { itemName="Ledox Dust",              amountToMaintain=qty("1m") },
+  { itemName="Callisto Ice Dust",       amountToMaintain=qty("1m")  },
 --  { itemName="Bauxite Dust",            amountToMaintain=qty("50m")  },
 --  { itemName="Crushed Monazite Ore",    amountToMaintain=qty("1m")  },
   { itemName="Holmium Dust",             amountToMaintain=qty("1m")  },
@@ -761,8 +761,8 @@ config.conditions = {
   { itemName="Nether Star",             amountToMaintain=qty("1m")   },
   { itemName="Europium Dust",           amountToMaintain=qty("10m")  },
 --    { itemName="Gadolinite-Y Dust",       amountToMaintain=qty("15m")  },
-  { itemName="Lutetium Dust",           amountToMaintain=qty("10m")  },
-  { itemName="Naquadah Dust",           amountToMaintain=qty("10m")  },
+  { itemName="Lutetium Dust",           amountToMaintain=qty("1m")  },
+  { itemName="Naquadah Oxide Mixture Dust",           amountToMaintain=qty("1m")  },
 --    { itemName="Nickel Dust",             amountToMaintain=qty("80m")  },
 --    { itemName="Phosphate Dust",          amountToMaintain=qty("30m")  },
 --    { itemName="Quartz Dust",             amountToMaintain=qty("60m")  },
@@ -770,7 +770,7 @@ config.conditions = {
   { itemName="Raw Silicon Dust",        amountToMaintain=qty("10m")  },
   { itemName="Infinity Catalyst Dust",  amountToMaintain=qty("10m") },
 --  { itemName="Tungsten Dust",           amountToMaintain=qty("10m")  },
-  { itemName="Plutonium 239 Dust",            amountToMaintain=qty("10m")  }
+  { itemName="Plutonium 239 Dust",            amountToMaintain=qty("1m")  }
 }
 
 --------------------------------------------------------------------------------
