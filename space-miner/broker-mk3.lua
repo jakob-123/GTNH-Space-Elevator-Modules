@@ -1,5 +1,7 @@
 -- MEDINA_SAFE_STOP_PATCH: UI cache + sorted dispatch + F10 safe stop
--- MEDINA_FAST_LOADER: supports batched inventory reads & uptime diagnostics
+-- MEDINA THREE_STACKS: 192 tips + 192 rods per job; resource reservations
+-- MEDINA REPAIR: compatible loader + visible module error details
+-- MEDINA_LOADER: restored slot reads, timed stages, and extra consumable stacks
 -- MEDINA_DUST_CONFIG: broker-owned dust configuration; paged dust node compatible
 -- =============================================================================
 -- MEDINA BROKER MK3  (v1.5)
@@ -41,10 +43,12 @@ assert(loggingModule and loggingModule.createLogger, "logger.lua not loaded")
 local logger = loggingModule.createLogger("broker-mk3")
 local getUnixTime = loggingModule.getCurrentTimestamp
 
-logger:info("========== BROKER-MK3 (v1.5) STARTUP ==========")
+logger:info("========== BROKER-MK3 (v1.5 REPAIR) STARTUP ==========")
 
 -- Surface task crashes in the log instead of swallowing them.
+local taskErrors = {}
 sched.onError = function(name, err)
+  taskErrors[name] = tostring(err)
   logger:error("[TASK] " .. tostring(name) .. " crashed: " .. tostring(err))
 end
 
@@ -140,6 +144,8 @@ local PW = P2 - 2
 local DISPATCH_INTERVAL = 0.2
 local lastDispatchCheck = 0
 local ERROR_TIMEOUT = 10
+-- hw_telem.lua reports kits as matched individual items, not 64-item packs.
+local CONSUMABLES_PER_JOB = 3 * 64
 local lastErrorTime = {}
 -- Keep expensive machine state reads off the hot scheduler path.
 local MACHINE_POLL_INTERVAL = 0.5
@@ -151,38 +157,26 @@ local TELEMETRY_TIMEOUT = 40    -- no new dispatch with stale fluid/HW readings
 -- MODULE LIFECYCLE
 -- =============================================================================
 
--- Batch inventory reads avoid a server-tick round trip for every slot.
--- getAllStacks includes empty slots; never use ipairs to traverse it.
-local function inventorySnapshot(mod, side)
-  local iterator, err = mod.transposer.getAllStacks(side)
-  if not iterator then error("getAllStacks: " .. tostring(err)) end
-  local stacks = iterator.getAll()
-  if type(stacks) ~= "table" then error("getAllStacks.getAll() failed") end
-  return stacks
-end
-
-local function anyItems(stacks)
-  for _, stack in pairs(stacks) do
-    if type(stack) == "table" and (stack.size or 0) > 0 then return true end
-  end
-  return false
-end
-
+-- Recovery uses known-working slot calls. This path runs only on job cleanup,
+-- not while loading, so correctness matters more than a few saved ticks.
 local function returnItemsToME(mod)
-  local stacks = inventorySnapshot(mod, mod.conf.inputBusSide)
-  for slot, stack in pairs(stacks) do
-    if type(slot) == "number" and type(stack) == "table"
-        and (stack.size or 0) > 0 then
+  local size = mod.transposer.getInventorySize(mod.conf.inputBusSide)
+  if not size then return false, "input bus not accessible" end
+  for slot = 1, size do
+    local amount = mod.transposer.getSlotStackSize(mod.conf.inputBusSide, slot) or 0
+    if amount > 0 then
       local moved = mod.transposer.transferItem(
-        mod.conf.inputBusSide, mod.conf.interfaceSide, stack.size, slot)
-      if type(moved) ~= "number" or moved < stack.size then
-        return false, "bus slot " .. slot .. " returned " .. tostring(moved)
-          .. "/" .. stack.size
+        mod.conf.inputBusSide, mod.conf.interfaceSide, amount, slot)
+      if type(moved) ~= "number" or moved < amount then
+        return false, string.format("bus slot %d moved %s/%d to ME",
+          slot, tostring(moved), amount)
       end
     end
   end
-  if anyItems(inventorySnapshot(mod, mod.conf.inputBusSide)) then
-    return false, "items remain in the input bus"
+  for slot = 1, size do
+    if (mod.transposer.getSlotStackSize(mod.conf.inputBusSide, slot) or 0) > 0 then
+      return false, "items remain in bus after recovery"
+    end
   end
   return true
 end
@@ -205,6 +199,8 @@ end
 -- every other module's load AND with the UI/telemetry loop.
 local function beginLoad(mod)
   mod.loadResult = nil
+  mod.lastError = nil
+  taskErrors["load-M" .. mod.index] = nil
   mod.loadStart = computer.uptime()
   mod.loadHandle = sched.spawn(function()
     -- Do not wrap a yielding loader task in pcall: some OC Lua backends cannot
@@ -220,13 +216,15 @@ end
 
 local function pollLoad(mod)
   if mod.loadHandle and mod.loadHandle.done() and not mod.loadResult then
-    mod.loadResult = {ok = false, err = "loader task stopped without a result"}
+    mod.loadResult = {ok = false, err = taskErrors["load-M" .. mod.index]
+      or "loader task stopped without a result"}
   end
   if not mod.loadResult then return end
   local r = mod.loadResult
   mod.loadHandle = nil
   mod.loadResult = nil
   if not r.ok then
+    mod.lastError = tostring(r.err)
     mod.status = "ERROR"
     lastErrorTime[mod.index] = computer.uptime()
     logger:error("[LOAD] M" .. mod.index .. " failed: " .. tostring(r.err))
@@ -253,6 +251,7 @@ local function pollLoad(mod)
   end)
   if not ok then
     mod.status = "ERROR"
+    mod.lastError = "start: " .. tostring(err)
     lastErrorTime[mod.index] = computer.uptime()
     pcall(mod.adapter.setWorkAllowed, false)
     logger:error("[LOAD] M" .. mod.index .. " could not start: " .. tostring(err))
@@ -282,6 +281,7 @@ local function stepRunning(mod)
   elseif not mod.seenActive then
     if now - (mod.runningSince or now) >= STARTUP_GRACE then
       mod.status = "ERROR"
+      mod.lastError = "machine never started"
       lastErrorTime[mod.index] = now
       pcall(mod.adapter.setWorkAllowed, false)
       logger:error("[MACHINE] M" .. mod.index .. " never started within " .. STARTUP_GRACE .. "s")
@@ -308,6 +308,7 @@ local function stepDone(mod)
     end)
     if not ok or result ~= true then
       mod.status = "ERROR"
+      mod.lastError = "cleanup: " .. tostring(ok and err or result)
       lastErrorTime[mod.index] = computer.uptime()
       logger:error("[CLEANUP] M" .. mod.index .. " could not recover bus: "
         .. tostring(ok and err or result))
@@ -404,6 +405,7 @@ local function getIdleModules()
         if ok and result == true then
           if mod.job then brokerState.jobs[mod.job.jobId] = nil end
           mod.status = "IDLE"
+          mod.lastError = nil
           mod.job = nil
           mod.doneTime = nil
           mod.loadResult = nil
@@ -435,11 +437,10 @@ local function tryDispatch(mod, asteroid, droneKey)
   local drillKey = config.droneDrillMap[droneTier]
   if not drillKey then return false end
 
-  -- Don't dispatch if we have no drill kit for this drone tier — otherwise the
-  -- load would just fail at the store() step waiting for tips/rods that aren't
-  -- in the ME network.
+  -- hw_telem.lua calls min(tips, rods) "kits": this is a count of ITEMS.
+  -- Each three-stack job needs 192 of both before any module is committed.
   local drill = brokerState.drills[drillKey]
-  if not drill or (drill.kits or 0) <= 0 then return false end
+  if not drill or (drill.kits or 0) < CONSUMABLES_PER_JOB then return false end
 
   local jobId = nodeId .. "-" .. os.time() .. "-M" .. mod.index
   mod.status = "LOADING"
@@ -477,14 +478,16 @@ local function availableDrones()
   return avail
 end
 
--- Same idea for drill kits: stock minus kits already committed to busy modules.
+-- Same idea for drill consumables. HW telemetry's 'kits' value counts
+-- matched individual tips/rods (not 64-item packs). Reserve a FULL load
+-- for each module still committed, so dispatch won't over-allocate stock.
 local function availableKits()
   local avail = {}
   for key, d in pairs(brokerState.drills) do avail[key] = (d and d.kits) or 0 end
   for _, mod in ipairs(modules) do
     if mod.status ~= "IDLE" and mod.job and mod.job.drillKey then
       local k = mod.job.drillKey
-      avail[k] = (avail[k] or 0) - 1
+      avail[k] = (avail[k] or 0) - CONSUMABLES_PER_JOB
     end
   end
   return avail
@@ -557,7 +560,7 @@ local function dispatchBatch()
             while #idleModules > 0
                 and (astCount[asteroidName] or 0) < cap
                 and (avail[droneKey] or 0) > 0
-                and (availKit[drillKey] or 0) > 0 do
+                and (availKit[drillKey] or 0) >= CONSUMABLES_PER_JOB do
               local assigned = false
               for idx = #idleModules, 1, -1 do
                 local mod = idleModules[idx]
@@ -566,7 +569,7 @@ local function dispatchBatch()
                     and tryDispatch(mod, asteroidName, droneKey) then
                   astCount[asteroidName] = (astCount[asteroidName] or 0) + 1
                   avail[droneKey] = avail[droneKey] - 1
-                  availKit[drillKey] = availKit[drillKey] - 1
+                  availKit[drillKey] = availKit[drillKey] - CONSUMABLES_PER_JOB
                   table.remove(idleModules, idx)
                   assigned = true
                   break
@@ -736,6 +739,9 @@ local function drawModulePanel()
           mod.job and mod.job.asteroid or ""), 0xFFFF00)
     elseif mod.status == "ERROR" then
       put(string.format("  M%d [%-5s]  ERROR", mod.index, mod.tier), 0xFF4444)
+      if mod.lastError then
+        put("    " .. tostring(mod.lastError):sub(1, PW - 4), 0xFF8888)
+      end
     else
       put(string.format("  M%d [%-5s]  IDLE", mod.index, mod.tier), 0x555555)
     end
