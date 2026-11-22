@@ -1,4 +1,5 @@
 -- MEDINA_SAFE_STOP_PATCH: UI cache + sorted dispatch + F10 safe stop
+-- MEDINA DRONE FIX: account only for allocations not reflected in HW telemetry
 -- MEDINA THREE_STACKS: 192 tips + 192 rods per job; resource reservations
 -- MEDINA REPAIR: compatible loader + visible module error details
 -- MEDINA_LOADER: restored slot reads, timed stages, and extra consumable stacks
@@ -449,6 +450,11 @@ local function tryDispatch(mod, asteroid, droneKey)
     distance = getOptimalDistance(mod.tier, asteroid, droneKey),
     parallels = config.moduleTiers[mod.tier].maxParallels,
     startTime = os.time(),
+    -- These reservations cover allocations NOT YET reflected in the most
+    -- recent HW_UPDATE. Once AE2 stock is observed to decrease, the counts
+    -- below are reconciled and do not get subtracted a second time.
+    pendingDrone = 1,
+    pendingKits = CONSUMABLES_PER_JOB,
   }
   brokerState.jobs[jobId] = {
     moduleIndex = mod.index, asteroid = asteroid,
@@ -460,34 +466,88 @@ local function tryDispatch(mod, asteroid, droneKey)
   return true
 end
 
--- How many of each drone are actually free to assign right now?
--- = telemetry stock  -  drones already committed to non-idle modules.
--- Telemetry lags (HW_UPDATE every 10s), so a drone we assigned 2s ago may still
--- show "in stock". Subtracting in-flight commitments prevents handing the same
--- physical drone to multiple modules — the bug that caused "Infinity Catalyst
--- everywhere" when only one high-tier drone existed.
+-- Avoid double-reserving materials that have already left AE2.
+-- HW telemetry is a snapshot of CURRENT network stock. The broker reserves
+-- only allocations that are not yet visible as a stock decrease in a snapshot.
+-- For example: AE2 reports 2 MK-IX drones, we dispatch 1 (pending=1), then
+-- AE2 reports 1. The pending reservation is acknowledged (pending=0), so the
+-- remaining 1 drone stays available to another module.
+--
+-- The hardware relay currently omits entries with stock=0. Missing entries
+-- must therefore NOT be interpreted as an observed decrease by this broker.
+-- Such pending reservations are conservatively retained until they can be
+-- reconciled or the module safely returns its items and drops its job.
+local function reconcileHardwareReservations(newDrones, newDrills)
+  -- Compare successive positive-count reports for each drone tier.
+  for _, key in ipairs(config.droneKeyOrder) do
+    local newCount = newDrones and newDrones[key]
+    if type(newCount) == "number" and newCount >= 0 then
+      local previous = brokerState.drones[key] or 0
+      local decrease = math.max(0, previous - newCount)
+      if decrease > 0 then
+        for _, mod in ipairs(modules) do
+          local job = mod.job
+          if job and job.droneKey == key and (job.pendingDrone or 0) > 0 then
+            local acknowledged = math.min(job.pendingDrone, decrease)
+            job.pendingDrone = job.pendingDrone - acknowledged
+            decrease = decrease - acknowledged
+            if decrease <= 0 then break end
+          end
+        end
+      end
+    end
+  end
+
+  -- Drill 'kits' are a number of matched tip/rod ITEMS, not stacks.
+  -- One job reserves 192 tips and 192 rods. Just like drones, only keep
+  -- reservations for quantities not yet reflected in a subsequent snapshot.
+  for _, key in ipairs(drillKeyOrder) do
+    local reading = newDrills and newDrills[key]
+    local newCount = type(reading) == "table" and reading.kits or nil
+    if type(newCount) == "number" and newCount >= 0 then
+      local previous = (brokerState.drills[key] or {}).kits or 0
+      local decrease = math.max(0, previous - newCount)
+      if decrease > 0 then
+        for _, mod in ipairs(modules) do
+          local job = mod.job
+          if job and job.drillKey == key and (job.pendingKits or 0) > 0 then
+            local acknowledged = math.min(job.pendingKits, decrease)
+            job.pendingKits = job.pendingKits - acknowledged
+            decrease = decrease - acknowledged
+            if decrease <= 0 then break end
+          end
+        end
+      end
+    end
+  end
+end
+
+-- Count only withdrawals that are still outstanding against the latest HW
+-- snapshot. Busy miners whose items were already deducted from AE2 are NOT
+-- subtracted a second time.
 local function availableDrones()
   local avail = {}
   for key, count in pairs(brokerState.drones) do avail[key] = count end
   for _, mod in ipairs(modules) do
-    if mod.status ~= "IDLE" and mod.job and mod.job.droneKey then
-      local k = mod.job.droneKey
-      avail[k] = (avail[k] or 0) - 1
+    local job = mod.job
+    if job and (job.pendingDrone or 0) > 0 then
+      local k = job.droneKey
+      avail[k] = (avail[k] or 0) - job.pendingDrone
     end
   end
   return avail
 end
 
--- Same idea for drill consumables. HW telemetry's 'kits' value counts
--- matched individual tips/rods (not 64-item packs). Reserve a FULL load
--- for each module still committed, so dispatch won't over-allocate stock.
 local function availableKits()
   local avail = {}
-  for key, d in pairs(brokerState.drills) do avail[key] = (d and d.kits) or 0 end
+  for key, d in pairs(brokerState.drills) do
+    avail[key] = (d and d.kits) or 0
+  end
   for _, mod in ipairs(modules) do
-    if mod.status ~= "IDLE" and mod.job and mod.job.drillKey then
-      local k = mod.job.drillKey
-      avail[k] = (avail[k] or 0) - CONSUMABLES_PER_JOB
+    local job = mod.job
+    if job and (job.pendingKits or 0) > 0 then
+      local k = job.drillKey
+      avail[k] = (avail[k] or 0) - job.pendingKits
     end
   end
   return avail
@@ -668,6 +728,9 @@ local function processMessage(evType, _, _, port, _, rawMsg)
     brokerState.lastFluidSyncUptime = computer.uptime()
     brokerState.lastFluidSync = os.date("%X")
   elseif msg.payloadType == "HW_UPDATE" then
+    -- Reconcile unobserved reservations BEFORE overwriting previous stock.
+    -- The relay's positive-only snapshot convention is preserved here.
+    reconcileHardwareReservations(msg.data.drones, msg.data.drills)
     if msg.data.drones then for k, v in pairs(msg.data.drones) do brokerState.drones[k] = v end end
     if msg.data.drills then for k, v in pairs(msg.data.drills) do brokerState.drills[k] = v end end
     brokerState.lastHWSyncTime = os.time()
