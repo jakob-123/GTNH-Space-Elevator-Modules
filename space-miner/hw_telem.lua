@@ -173,8 +173,6 @@ local function updateDashboard(assets)
   io.write("LAST_SYNC: " .. os.date("%X"))
 end
 
-drawStaticFrame()
-
 local lastAssets = { drones={}, drillTips={}, drillRods={} }
 
 -- Helper to build payload from assets
@@ -196,6 +194,7 @@ end
 modem.open(2025)  -- Query port for on-demand inventory requests
 
 while true do
+  drawStaticFrame()
   -- Scan the chest for current inventory
   lastAssets = scanAssets()
   updateDashboard(lastAssets)
