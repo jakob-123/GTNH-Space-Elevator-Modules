@@ -39,7 +39,7 @@ Export Bus into each module's input hatch. MEDINA does not handle plasma.
 On each computer (needs an Internet Card), grab the installer and run it:
 
 ```
-wget https://raw.githubusercontent.com/novashep/GTNH/main/space-miner/install-medina.lua /home/install-medina.lua
+wget https://raw.githubusercontent.com/jakob-123/GTNH-Space-Elevator-Modules/blob/main/space-miner/install-medina.lua /home/install-medina.lua
 install-medina
 ```
 
