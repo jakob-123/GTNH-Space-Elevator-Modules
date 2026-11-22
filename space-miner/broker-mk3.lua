@@ -1,4 +1,6 @@
 -- MEDINA_SAFE_STOP_PATCH: UI cache + sorted dispatch + F10 safe stop
+-- MEDINA_FAST_LOADER: supports batched inventory reads & uptime diagnostics
+-- MEDINA_DUST_CONFIG: broker-owned dust configuration; paged dust node compatible
 -- =============================================================================
 -- MEDINA BROKER MK3  (v1.5)
 -- Consolidated broker: telemetry aggregation + dispatch + cooperative consumable
@@ -139,19 +141,50 @@ local DISPATCH_INTERVAL = 0.2
 local lastDispatchCheck = 0
 local ERROR_TIMEOUT = 10
 local lastErrorTime = {}
+-- Keep expensive machine state reads off the hot scheduler path.
+local MACHINE_POLL_INTERVAL = 0.5
+local STARTUP_GRACE = 30          -- if never active, report ERROR instead of looping
+local IDLE_CONFIRM = 5           -- tolerate short gaps between mining cycles
+local TELEMETRY_TIMEOUT = 40    -- no new dispatch with stale fluid/HW readings
 
 -- =============================================================================
 -- MODULE LIFECYCLE
 -- =============================================================================
 
+-- Batch inventory reads avoid a server-tick round trip for every slot.
+-- getAllStacks includes empty slots; never use ipairs to traverse it.
+local function inventorySnapshot(mod, side)
+  local iterator, err = mod.transposer.getAllStacks(side)
+  if not iterator then error("getAllStacks: " .. tostring(err)) end
+  local stacks = iterator.getAll()
+  if type(stacks) ~= "table" then error("getAllStacks.getAll() failed") end
+  return stacks
+end
+
+local function anyItems(stacks)
+  for _, stack in pairs(stacks) do
+    if type(stack) == "table" and (stack.size or 0) > 0 then return true end
+  end
+  return false
+end
+
 local function returnItemsToME(mod)
-  local busSize = mod.transposer.getInventorySize(mod.conf.inputBusSide) or 16
-  for slot = 1, busSize do
-    local size = mod.transposer.getSlotStackSize(mod.conf.inputBusSide, slot) or 0
-    if size > 0 then
-      mod.transposer.transferItem(mod.conf.inputBusSide, mod.conf.interfaceSide, size, slot)
+  local stacks = inventorySnapshot(mod, mod.conf.inputBusSide)
+  for slot, stack in pairs(stacks) do
+    if type(slot) == "number" and type(stack) == "table"
+        and (stack.size or 0) > 0 then
+      local moved = mod.transposer.transferItem(
+        mod.conf.inputBusSide, mod.conf.interfaceSide, stack.size, slot)
+      if type(moved) ~= "number" or moved < stack.size then
+        return false, "bus slot " .. slot .. " returned " .. tostring(moved)
+          .. "/" .. stack.size
+      end
     end
   end
+  if anyItems(inventorySnapshot(mod, mod.conf.inputBusSide)) then
+    return false, "items remain in the input bus"
+  end
+  return true
 end
 
 local function clearInterfaceSlots(mod)
@@ -172,70 +205,124 @@ end
 -- every other module's load AND with the UI/telemetry loop.
 local function beginLoad(mod)
   mod.loadResult = nil
-  mod.loadStart = computer.uptime()  -- real seconds, for elapsed readout
+  mod.loadStart = computer.uptime()
   mod.loadHandle = sched.spawn(function()
-    local ok, errOrStats = loader.run(mod, mod.job, {
+    -- Do not wrap a yielding loader task in pcall: some OC Lua backends cannot
+    -- yield across that boundary. The scheduler logs crashes and pollLoad()
+    -- notices a finished task that did not return a result.
+    local ok, result = loader.run(mod, mod.job, {
       config = config, logger = logger, db = db, dbAddr = dbAddr,
     })
-    mod.loadResult = ok and { ok = true, stats = errOrStats }
-                        or  { ok = false, err = errOrStats }
+    mod.loadResult = ok and {ok = true, stats = result}
+                        or {ok = false, err = result}
   end, "load-M" .. mod.index)
 end
 
--- Called each frame for a LOADING module: check whether its task finished.
 local function pollLoad(mod)
-  if not mod.loadResult then return end  -- still loading
-
+  if mod.loadHandle and mod.loadHandle.done() and not mod.loadResult then
+    mod.loadResult = {ok = false, err = "loader task stopped without a result"}
+  end
+  if not mod.loadResult then return end
   local r = mod.loadResult
   mod.loadHandle = nil
   mod.loadResult = nil
+  if not r.ok then
+    mod.status = "ERROR"
+    lastErrorTime[mod.index] = computer.uptime()
+    logger:error("[LOAD] M" .. mod.index .. " failed: " .. tostring(r.err))
+    pcall(mod.adapter.setWorkAllowed, false)
+    return
+  end
 
-  if r.ok then
-    -- Diagnostics: how many polls did the read-backs take? Tells us whether
-    -- store() is reliable on this setup (low) or returns early (higher).
-    local s = r.stats or {}
-    local cp = s.confirmPolls or {}
-    local elapsed = mod.loadStart and (computer.uptime() - mod.loadStart) or 0
-    -- Compact on-screen diagnostic: time to load + read-back poll counts.
-    -- "db" = max polls any fingerprint needed (low => store() reliable here),
-    -- "buf" = polls waiting for items to arrive in the interface buffer.
-    local maxConfirm = math.max(cp.drone or 0, cp.tip or 0, cp.rod or 0)
-    mod.lastLoad = string.format("loaded %.1fs  db:%d buf:%d", elapsed, maxConfirm, s.arrivePolls or 0)
-    logger:info(string.format(
-      "[LOAD] M%d ready (confirm polls d=%s t=%s r=%s, arrive=%s)",
-      mod.index, tostring(cp.drone), tostring(cp.tip), tostring(cp.rod),
-      tostring(s.arrivePolls)))
-    mod.status = "RUNNING"
-    mod.job.startTime = os.time()
+  local s = r.stats or {}
+  local cp = s.confirmPolls or {}
+  local elapsed = mod.loadStart and computer.uptime() - mod.loadStart or 0
+  local dbPolls = math.max(cp.drone or 0, cp.tip or 0, cp.rod or 0)
+  mod.lastLoad = string.format("loaded %.1fs  db:%d buf:%d", elapsed,
+    dbPolls, s.arrivePolls or 0)
+  local stages = s.stages or {}
+  logger:info(string.format(
+    "[LOAD] M%d %.2fs: cleanup=%.2f fingerprint=%.2f stocking=%.2f transfer=%.2f verify=%.2f (db:%d buf:%d)",
+    mod.index, elapsed, stages.cleanup or 0, stages.fingerprints or 0,
+    stages.stocking or 0, stages.transfer or 0, stages.verify or 0,
+    dbPolls, s.arrivePolls or 0))
+
+  local ok, err = pcall(function()
     mod.adapter.setParameters(mod.conf.distanceParam, 0, mod.job.distance)
     mod.adapter.setWorkAllowed(true)
-  else
+  end)
+  if not ok then
     mod.status = "ERROR"
-    logger:error("[LOAD] M" .. mod.index .. " failed: " .. tostring(r.err))
+    lastErrorTime[mod.index] = computer.uptime()
+    pcall(mod.adapter.setWorkAllowed, false)
+    logger:error("[LOAD] M" .. mod.index .. " could not start: " .. tostring(err))
+    return
   end
+  mod.status = "RUNNING"
+  mod.runningSince = computer.uptime()
+  mod.nextMachinePoll = 0
+  mod.seenActive = false
+  mod.inactiveSince = nil
+  mod.job.startTime = os.time()  -- display-only, not elapsed time
+  mod.job.startUptime = mod.runningSince
 end
 
 local function stepRunning(mod)
-  if not mod.adapter.isMachineActive() then
-    mod.status = "DONE"
-    mod.adapter.setWorkAllowed(false)
+  local now = computer.uptime()
+  if now < (mod.nextMachinePoll or 0) then return end
+  mod.nextMachinePoll = now + MACHINE_POLL_INTERVAL
+  local ok, active = pcall(mod.adapter.isMachineActive)
+  if not ok then
+    logger:error("[MACHINE] M" .. mod.index .. " state unreadable: " .. tostring(active))
+    return -- never treat an API failure as an inactive mining cycle
+  end
+  if active then
+    mod.seenActive = true
+    mod.inactiveSince = nil
+  elseif not mod.seenActive then
+    if now - (mod.runningSince or now) >= STARTUP_GRACE then
+      mod.status = "ERROR"
+      lastErrorTime[mod.index] = now
+      pcall(mod.adapter.setWorkAllowed, false)
+      logger:error("[MACHINE] M" .. mod.index .. " never started within " .. STARTUP_GRACE .. "s")
+    end
+  else
+    mod.inactiveSince = mod.inactiveSince or now
+    if now - mod.inactiveSince >= IDLE_CONFIRM then
+      local disabled = pcall(mod.adapter.setWorkAllowed, false)
+      if not disabled then
+        logger:error("[MACHINE] M" .. mod.index .. " disable call failed")
+        return
+      end
+      mod.status = "DONE"
+    end
   end
 end
 
 local function stepDone(mod)
   if not mod.doneTime then
-    mod.doneTime = os.time()
-    returnItemsToME(mod)
-    clearInterfaceSlots(mod)
-    mod.adapter.setWorkAllowed(false)
-  elseif os.time() - mod.doneTime >= 1 then
-    if mod.job and brokerState.jobs[mod.job.jobId] then
-      brokerState.jobs[mod.job.jobId] = nil
+    local ok, result, err = pcall(function()
+      mod.adapter.setWorkAllowed(false)
+      clearInterfaceSlots(mod)  -- disable restocking before returning leftovers
+      return returnItemsToME(mod)
+    end)
+    if not ok or result ~= true then
+      mod.status = "ERROR"
+      lastErrorTime[mod.index] = computer.uptime()
+      logger:error("[CLEANUP] M" .. mod.index .. " could not recover bus: "
+        .. tostring(ok and err or result))
+      return
     end
+    mod.doneTime = computer.uptime()
+  elseif computer.uptime() - mod.doneTime >= 1 then
+    if mod.job then brokerState.jobs[mod.job.jobId] = nil end
     mod.job = nil
     mod.status = "IDLE"
     mod.doneTime = nil
-    lastDispatchCheck = os.time() - DISPATCH_INTERVAL
+    mod.runningSince = nil
+    mod.seenActive = nil
+    mod.inactiveSince = nil
+    lastDispatchCheck = computer.uptime() - DISPATCH_INTERVAL
   end
 end
 
@@ -256,9 +343,11 @@ end
 -- bookkeeping entry doesn't linger). The per-asteroid cap reads live module
 -- status, not this table, so this is just housekeeping.
 local function pruneStaleJobs()
-  local now = os.time()
+  local now = computer.uptime()
   for jobId, job in pairs(brokerState.jobs) do
-    if now - job.startTime > 300 then brokerState.jobs[jobId] = nil end
+    if job.startUptime and now - job.startUptime > 300 then
+      brokerState.jobs[jobId] = nil
+    end
   end
 end
 
@@ -293,19 +382,42 @@ end
 
 local function getIdleModules()
   local idle = {}
-  local now = os.time()
+  local now = computer.uptime()
   for i, mod in ipairs(modules) do
     if mod.status == "IDLE" then
-      idle[#idle+1] = mod
+      idle[#idle + 1] = mod
     elseif mod.status == "ERROR" then
-      if not lastErrorTime[i] then
+      if not lastErrorTime[i] then lastErrorTime[i] = now end
+      if now - lastErrorTime[i] >= ERROR_TIMEOUT
+          and not (mod.loadHandle and not mod.loadHandle.done()) then
+        -- Never silently reuse a module with active machinery or leftover
+        -- inventory. A failed recovery remains ERROR and is retried later.
+        local ok, result, message = pcall(function()
+          mod.adapter.setWorkAllowed(false)
+          if mod.adapter.isMachineActive() then
+            return false, "machine is still active"
+          end
+          clearInterfaceSlots(mod)
+          return returnItemsToME(mod)
+        end)
         lastErrorTime[i] = now
-      elseif now - lastErrorTime[i] >= ERROR_TIMEOUT then
-        pcall(function() returnItemsToME(mod) end)
-        mod.status = "IDLE"; mod.job = nil; mod.doneTime = nil
-        lastErrorTime[i] = nil
-        logger:info("[RECOVERY] M" .. i .. " auto-recovered from ERROR state")
-        idle[#idle+1] = mod
+        if ok and result == true then
+          if mod.job then brokerState.jobs[mod.job.jobId] = nil end
+          mod.status = "IDLE"
+          mod.job = nil
+          mod.doneTime = nil
+          mod.loadResult = nil
+          mod.loadHandle = nil
+          mod.runningSince = nil
+          mod.seenActive = nil
+          mod.inactiveSince = nil
+          lastErrorTime[i] = nil
+          logger:info("[RECOVERY] M" .. i .. " verified idle and empty; recovered")
+          idle[#idle + 1] = mod
+        else
+          logger:error("[RECOVERY] M" .. i .. " deferred: "
+            .. tostring(ok and message or result))
+        end
       end
     end
   end
@@ -337,7 +449,10 @@ local function tryDispatch(mod, asteroid, droneKey)
     parallels = config.moduleTiers[mod.tier].maxParallels,
     startTime = os.time(),
   }
-  brokerState.jobs[jobId] = { moduleIndex = mod.index, asteroid = asteroid, startTime = os.time() }
+  brokerState.jobs[jobId] = {
+    moduleIndex = mod.index, asteroid = asteroid,
+    startTime = os.time(), startUptime = computer.uptime()
+  }
   brokerState.nextTarget = { asteroid = asteroid, reason = "dispatched" }
 
   beginLoad(mod)  -- non-blocking: spawns the cooperative load task
@@ -547,11 +662,13 @@ local function processMessage(evType, _, _, port, _, rawMsg)
       if brokerState.plasma[name] ~= nil then brokerState.plasma[name] = amount end
     end
     brokerState.lastFluidSyncTime = os.time()
+    brokerState.lastFluidSyncUptime = computer.uptime()
     brokerState.lastFluidSync = os.date("%X")
   elseif msg.payloadType == "HW_UPDATE" then
     if msg.data.drones then for k, v in pairs(msg.data.drones) do brokerState.drones[k] = v end end
     if msg.data.drills then for k, v in pairs(msg.data.drills) do brokerState.drills[k] = v end end
     brokerState.lastHWSyncTime = os.time()
+    brokerState.lastHWSyncUptime = computer.uptime()
     brokerState.lastHWSync = os.date("%X")
   end
 end
@@ -1018,7 +1135,8 @@ while true do
   --    iteration so concurrent loads progress as fast as the hardware allows.
   sched.tick()
 
-  -- 3. Advance module lifecycle (load results, running->done, cleanup).
+  -- 3. Advance module lifecycle. Machine activity is checked at most every
+  --    0.5s per RUNNING module, not once on every ~0.01s loop iteration.
   stepModules()
 
   -- 4. Telemetry-ready gate. All three telem sources are required: dust (what to
@@ -1031,10 +1149,14 @@ while true do
   end
 
   -- 5. Dispatch on its own cadence.
-  local now = os.time()
+  local now = computer.uptime()
   if brokerState.telemetryReady
+      and brokerState.lastFluidSyncUptime
+      and now - brokerState.lastFluidSyncUptime < TELEMETRY_TIMEOUT
+      and brokerState.lastHWSyncUptime
+      and now - brokerState.lastHWSyncUptime < TELEMETRY_TIMEOUT
       and brokerState.lastDustSyncUptime
-      and computer.uptime() - brokerState.lastDustSyncUptime < 35
+      and now - brokerState.lastDustSyncUptime < 35
       and (now - lastDispatchCheck >= DISPATCH_INTERVAL) then
     dispatchBatch()
     lastDispatchCheck = now
