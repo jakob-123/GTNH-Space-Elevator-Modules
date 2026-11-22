@@ -107,9 +107,8 @@ local function updateDashboard(sorted)
   io.write("LAST_SYNC: " .. os.date("%X"))
 end
 
-drawStaticFrame()
-
 while true do
+  drawStaticFrame()
   local stocks = scanDustStock()
   local sorted = buildSortedList(stocks)
   updateDashboard(sorted)
