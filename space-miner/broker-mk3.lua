@@ -1,3 +1,4 @@
+-- MEDINA_SAFE_STOP_PATCH: UI cache + sorted dispatch + F10 safe stop
 -- =============================================================================
 -- MEDINA BROKER MK3  (v1.5)
 -- Consolidated broker: telemetry aggregation + dispatch + cooperative consumable
@@ -24,6 +25,7 @@
 local component = require("component")
 local serial    = require("serialization")
 local event     = require("event")
+local keyboard  = require("keyboard")
 local term      = require("term")
 local fs        = require("filesystem")
 local computer  = require("computer")
@@ -281,7 +283,10 @@ local function findNeedsList()
     end)
   else
     -- Threshold: most-depleted (lowest stock/target ratio) first.
-    table.sort(needs, function(a, b) return a.ratio < b.ratio end)
+    table.sort(needs, function(a, b)
+      if a.ratio == b.ratio then return a.itemName < b.itemName end
+      return a.ratio < b.ratio
+    end)
   end
   return needs
 end
@@ -402,55 +407,57 @@ end
 
 local function dispatchBatch()
   pruneStaleJobs()
-
-  -- No plasma = modules can't run. Hold dispatch until some is in stock.
   if not hasPlasma() then return end
 
   local idleModules = getIdleModules()
   if #idleModules == 0 then return end
-
-  local needs = findNeedsList()
+  local needs = findNeedsList() -- already sorted (threshold or rarity mode)
   if #needs == 0 then return end
 
-  local neededAsteroids = {}
-  for _, need in ipairs(needs) do neededAsteroids[need.asteroid] = need end
+  local avail = availableDrones()
+  local availKit = availableKits()
+  local cap = asteroidCap()
+  local astCount = activeAsteroidCounts()
+  local seenAsteroids = {}
+  local moduleTierNumbers = { ["MK-I"] = 1, ["MK-II"] = 2, ["MK-III"] = 3 }
 
-  -- Working pools we can still hand out this batch: drones and drill kits.
-  local avail     = availableDrones()
-  local availKit  = availableKits()
-
-  -- Per-asteroid usage: start from what's already committed, count up as we go,
-  -- and never exceed the cap. This is what frees module slots for lower-tier
-  -- needs (e.g. Uranium-Plutonium) instead of one asteroid eating them all.
-  local cap        = asteroidCap()
-  local astCount   = activeAsteroidCounts()
-
-  for _, droneKey in ipairs(config.droneKeyOrder) do
-    if (avail[droneKey] or 0) > 0 then
-      local droneTier = config.droneTierKeys[droneKey]
-      local drillKey  = config.droneDrillMap[droneTier]
-
-      -- Need both a free drone AND a free kit of the matching material.
-      if drillKey and (availKit[drillKey] or 0) > 0 then
-        for asteroidName, asteroidData in pairs(config.asteroids) do
-          -- Stop scanning once we've exhausted this drone or its kits.
-          if (avail[droneKey] or 0) <= 0 or (availKit[drillKey] or 0) <= 0 then break end
-          if droneTier >= asteroidData.minDrone and droneTier <= asteroidData.maxDrone then
-            -- Eligible if it's a current need AND under its module cap.
-            if neededAsteroids[asteroidName] and (astCount[asteroidName] or 0) < cap then
+  -- PRIORITY FIRST, best compatible drone SECOND. Never use pairs() for
+  -- dispatch order, because pairs() destroys the sorted needs priority.
+  for _, need in ipairs(needs) do
+    if #idleModules == 0 then break end
+    local asteroidName = need.asteroid
+    if not seenAsteroids[asteroidName] then
+      seenAsteroids[asteroidName] = true
+      local asteroidData = config.asteroids[asteroidName]
+      if asteroidData then
+        for _, droneKey in ipairs(config.droneKeyOrder) do
+          if #idleModules == 0 or (astCount[asteroidName] or 0) >= cap then
+            break
+          end
+          local droneTier = config.droneTierKeys[droneKey]
+          local drillKey = config.droneDrillMap[droneTier]
+          if droneTier >= asteroidData.minDrone
+              and droneTier <= asteroidData.maxDrone
+              and drillKey then
+            while #idleModules > 0
+                and (astCount[asteroidName] or 0) < cap
+                and (avail[droneKey] or 0) > 0
+                and (availKit[drillKey] or 0) > 0 do
               local assigned = false
               for idx = #idleModules, 1, -1 do
                 local mod = idleModules[idx]
-                if tryDispatch(mod, asteroidName, droneKey) then
+                -- Respect the asteroid's module-tier requirement, too.
+                if (moduleTierNumbers[mod.tier] or 0) >= (asteroidData.minModule or 1)
+                    and tryDispatch(mod, asteroidName, droneKey) then
                   astCount[asteroidName] = (astCount[asteroidName] or 0) + 1
-                  avail[droneKey]        = avail[droneKey] - 1     -- consume a drone
-                  availKit[drillKey]     = availKit[drillKey] - 1  -- consume a kit
+                  avail[droneKey] = avail[droneKey] - 1
+                  availKit[drillKey] = availKit[drillKey] - 1
                   table.remove(idleModules, idx)
                   assigned = true
                   break
                 end
               end
-              if assigned and #idleModules == 0 then return end
+              if not assigned then break end
             end
           end
         end
@@ -458,7 +465,6 @@ local function dispatchBatch()
     end
   end
 end
-
 -- =============================================================================
 -- TELEMETRY
 -- =============================================================================
@@ -505,230 +511,161 @@ local function formatQty(n)
   else return tostring(n) end
 end
 
-local function drawModulePanel()
-  local row = 6
-  local function clear(r) gpu.fill(P1 + 1, r, PW, 1, " ") end
-  for r = 6, H do clear(r) end  -- wipe column first; sections shift between frames
-  for _, mod in ipairs(modules) do
-    if row > H then break end
-    clear(row); term.setCursor(P1 + 1, row)
-    if mod.status == "RUNNING" then
-      gpu.setForeground(0xFFAA00)
-      io.write(string.format("  M%d [%-5s]  %s", mod.index, mod.tier, mod.job and mod.job.asteroid or "?"))
-    elseif mod.status == "LOADING" then
-      gpu.setForeground(0xFFFF00)
-      io.write(string.format("  M%d [%-5s]  LOADING %s", mod.index, mod.tier, mod.job and mod.job.asteroid or ""))
-    elseif mod.status == "ERROR" then
-      gpu.setForeground(0xFF4444)
-      io.write(string.format("  M%d [%-5s]  ERROR", mod.index, mod.tier))
-    else
-      gpu.setForeground(0x555555)
-      io.write(string.format("  M%d [%-5s]  IDLE", mod.index, mod.tier))
-    end
-    row = row + 1
-    if (mod.status == "RUNNING") and mod.job and row <= H then
-      clear(row); term.setCursor(P1 + 3, row)
-      gpu.setForeground(0xCCCCCC)
-      local droneName = config.drones[mod.job.droneKey] or "?"
-      local lvl = droneName:match("MK%-(.+)") or "?"
-      io.write(string.format("dist=%d  drone=MK-%s", mod.job.distance or 0, lvl))
-      row = row + 1
-
-      -- Load diagnostic from the most recent load of this module:
-      -- "loaded 0.4s  db:1 buf:3" — time taken + read-back poll counts.
-      if mod.lastLoad and row <= H then
-        clear(row); term.setCursor(P1 + 3, row)
-        gpu.setForeground(0x668866)  -- dim green: informational
-        io.write(mod.lastLoad)
-        row = row + 1
-      end
-
-      -- Blank spacer line before the next module, per layout.
-      if row <= H then clear(row); row = row + 1 end
+-- Display lines are cached separately for each panel.  This eliminates
+-- clear-then-rewrite flicker and prevents old lines persisting when rows move.
+local panelCache = {modules = {}, dust = {}, hw = {}}
+local lastSyncText = nil
+local function invalidatePanelCache()
+  lastSyncText = nil
+  panelCache = {modules = {}, dust = {}, hw = {}}
+end
+local function paintPanel(x, lines, cached)
+  local padding = string.rep(" ", PW)
+  gpu.setBackground(0x000000)
+  for y = 6, H do
+    local entry = lines[y]
+    local content = entry and entry.text:sub(1, PW) or ""
+    local color = entry and entry.color or 0x666666
+    local previous = cached[y]
+    if not previous or previous.text ~= content or previous.color ~= color then
+      gpu.setForeground(color)
+      -- Write the complete line once. No intermediate empty frame, no wrap.
+      gpu.set(x, y, (content .. padding):sub(1, PW))
+      cached[y] = {text = content, color = color}
     end
   end
-  for r = row, H do gpu.fill(P1 + 1, r, PW, 1, " ") end
+end
+local function newWriter()
+  local lines, row = {}, 6
+  local function put(text, color)
+    if row <= H then
+      lines[row] = {text = text or "", color = color or 0xFFFFFF}
+    end
+    row = row + 1
+  end
+  local function skip(n) row = row + (n or 1) end
+  return lines, put, skip
 end
 
--- Keep a copy of the dust panel's last rendered lines.  A periodic full
--- erase made lower entries visibly flicker as the panel grew longer.
-local lastDustLines = {}
+local function drawModulePanel()
+  local lines, put = newWriter()
+  for _, mod in ipairs(modules) do
+    if mod.status == "RUNNING" then
+      put(string.format("  M%d [%-5s]  %s", mod.index, mod.tier,
+          mod.job and mod.job.asteroid or "?"), 0xFFAA00)
+    elseif mod.status == "LOADING" then
+      put(string.format("  M%d [%-5s]  LOADING %s", mod.index, mod.tier,
+          mod.job and mod.job.asteroid or ""), 0xFFFF00)
+    elseif mod.status == "ERROR" then
+      put(string.format("  M%d [%-5s]  ERROR", mod.index, mod.tier), 0xFF4444)
+    else
+      put(string.format("  M%d [%-5s]  IDLE", mod.index, mod.tier), 0x555555)
+    end
+    if mod.status == "RUNNING" and mod.job then
+      local droneName = config.drones[mod.job.droneKey] or "?"
+      local lvl = droneName:match("MK%-(.+)") or "?"
+      put(string.format("    dist=%d  drone=MK-%s", mod.job.distance or 0, lvl), 0xCCCCCC)
+      if mod.lastLoad then put("    " .. mod.lastLoad, 0x668866) end
+      put("", 0x666666)
+    end
+  end
+  paintPanel(P1 + 1, lines, panelCache.modules)
+end
+
 local function drawDustPanel()
-  local list, nextLines = {}, {}
+  local lines, put = newWriter()
+  local list = {}
   for _, cond in ipairs(config.conditions) do
     local name = cond.itemName
     local stock = (brokerState.dust[name] and brokerState.dust[name].stock) or 0
     local ratio = stock / cond.amountToMaintain
     list[#list + 1] = {
-      name = name, stock = stock,
-      threshold = cond.amountToMaintain, ratio = ratio
+      name = name, stock = stock, threshold = cond.amountToMaintain, ratio = ratio
     }
   end
-  -- Break equal-ratio ties consistently so rows don't swap unnecessarily.
+  -- Stable tie order avoids unnecessary movement for identical stock ratios.
   table.sort(list, function(a, b)
     if a.ratio == b.ratio then return a.name < b.name end
     return a.ratio < b.ratio
   end)
-
-  local row = 6
   for _, item in ipairs(list) do
-    if row > H then break end
     local pct = math.floor(item.ratio * 100)
-    local color = (item.ratio >= 1.0) and 0x446644
-               or (item.ratio < 0.25) and 0xFF4444
-               or (item.ratio < 0.75) and 0xFFAA00 or 0x00FFFF
+    local color = item.ratio >= 1.0 and 0x446644
+        or item.ratio < 0.25 and 0xFF4444
+        or item.ratio < 0.75 and 0xFFAA00 or 0x00FFFF
     local mark = item.ratio < 1.0 and "!" or " "
-    nextLines[row] = {
-      text = string.format("  %s %-27s %3d%%", mark, item.name, pct),
-      color = color
-    }
-    row = row + 1
-    if row > H then break end
-    nextLines[row] = {
-      text = string.format("      %s / %s", formatQty(item.stock), formatQty(item.threshold)),
-      color = 0x666666
-    }
-    row = row + 1
+    put(string.format("  %s %-27s %3d%%", mark, item.name, pct), color)
+    put(string.format("      %s / %s", formatQty(item.stock),
+        formatQty(item.threshold)), 0x666666)
   end
-
-  gpu.setBackground(0x000000)
-  local blank = string.rep(" ", PW)
-  for r = 6, H do
-    local line = nextLines[r]
-    local text = line and line.text:sub(1, PW) or ""
-    local color = line and line.color or 0x666666
-    local last = lastDustLines[r]
-    if not last or last.text ~= text or last.color ~= color then
-      gpu.setForeground(color)
-      gpu.set(P2 + 1, r, (text .. blank):sub(1, PW))
-      lastDustLines[r] = { text = text, color = color }
-    end
-  end
+  paintPanel(P2 + 1, lines, panelCache.dust)
 end
 
-
 local function drawHWPanel()
-  local row = 6
-  local function clear(r) gpu.fill(P3 + 1, r, PW, 1, " ") end
-
-  -- Wipe the whole panel column first. Sections here grow/shrink between frames
-  -- (plasma message appears/disappears, drone/kit lists change length), and
-  -- clearing only the rows we draw leaves "ghost" text on vacated rows when the
-  -- layout shifts up. Clearing the full column each frame makes ghosts impossible.
-  for r = 6, H do clear(r) end
-
-  clear(row); term.setCursor(P3 + 1, row)
+  local lines, put, skip = newWriter()
   if brokerState.nextTarget then
-    gpu.setForeground(0xFFAA00)
-    io.write("  NEXT: " .. brokerState.nextTarget.asteroid)
+    put("  NEXT: " .. brokerState.nextTarget.asteroid, 0xFFAA00)
   else
-    gpu.setForeground(0x666666); io.write("  NEXT: (idle)")
+    put("  NEXT: (idle)", 0x666666)
   end
-  row = row + 1
-
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x666666)
-  io.write("  PRIORITY: " .. brokerState.priorityMode:upper() .. "   CAP: " .. asteroidCap() .. "/asteroid")
-  row = row + 1
-
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x666666); io.write("  TELEMETRY SYNC:")
-  row = row + 1
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(getSyncColor(brokerState.lastDustSyncTime)); io.write("  Dust:   " .. brokerState.lastDustSync)
-  row = row + 1
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(getSyncColor(brokerState.lastFluidSyncTime)); io.write("  Fluid:  " .. brokerState.lastFluidSync)
-  row = row + 1
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(getSyncColor(brokerState.lastHWSyncTime)); io.write("  HW:     " .. brokerState.lastHWSync)
-  row = row + 2
-
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x888888); io.write("  TASKS RUNNING: " .. sched.count())
-  row = row + 2
-
-  -- Plasma stock (required to mine — a module won't run without a plasma fluid).
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x888888); io.write("  PLASMA STOCK:")
-  row = row + 1
+  put("  PRIORITY: " .. brokerState.priorityMode:upper()
+    .. "   CAP: " .. asteroidCap() .. "/asteroid", 0x666666)
+  put("  TELEMETRY SYNC:", 0x666666)
+  put("  Dust:   " .. brokerState.lastDustSync,
+    getSyncColor(brokerState.lastDustSyncTime))
+  put("  Fluid:  " .. brokerState.lastFluidSync,
+    getSyncColor(brokerState.lastFluidSyncTime))
+  put("  HW:     " .. brokerState.lastHWSync,
+    getSyncColor(brokerState.lastHWSyncTime))
+  skip(1)
+  put("  TASKS RUNNING: " .. sched.count(), 0x888888)
+  skip(1)
+  put("  PLASMA STOCK:", 0x888888)
   local anyPlasma = false
   for _, name in ipairs(config.plasmaKeyOrder) do
     local amt = brokerState.plasma[name] or 0
-    if row > H then break end
-    clear(row); term.setCursor(P3 + 1, row)
-    gpu.setForeground(amt > 0 and 0xFF00FF or 0x555555)
     local short = name:gsub(" Plasma", "")
-    io.write(string.format("  %-16s %8d mB", short, amt))
-    row = row + 1
+    put(string.format("  %-16s %8d mB", short, amt),
+      amt > 0 and 0xFF00FF or 0x555555)
     if amt > 0 then anyPlasma = true end
   end
   if not anyPlasma then
-    if row > H then return end
-    clear(row); term.setCursor(P3 + 1, row)
     if brokerState.lastFluidSyncTime == 0 then
-      gpu.setForeground(0xFFAA00); io.write("  [ waiting for fluid telemetry... ]")
+      put("  [ waiting for fluid telemetry... ]", 0xFFAA00)
     else
-      gpu.setForeground(0xFF4444); io.write("  [ NO PLASMA - MINING BLOCKED ]")
+      put("  [ NO PLASMA - MINING BLOCKED ]", 0xFF4444)
     end
-    row = row + 1
   end
-  row = row + 1
-
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x888888); io.write("  DRONES IN STOCK:")
-  row = row + 1
-  local any = false
+  skip(1)
+  put("  DRONES IN STOCK:", 0x888888)
+  local anyDrone = false
   for _, key in ipairs(config.droneKeyOrder) do
     local count = brokerState.drones[key] or 0
     if count > 0 then
-      if row > H then break end
-      clear(row); term.setCursor(P3 + 1, row)
-      gpu.setForeground(0x00FFFF)
       local droneName = config.drones[key] or ("Drone-" .. key)
       local lvl = droneName:match("MK%-(.+)") or "?"
-      io.write(string.format("  %-18s  x%d", "MK-" .. lvl, count))
-      row = row + 1; any = true
+      put(string.format("  %-18s  x%d", "MK-" .. lvl, count), 0x00FFFF)
+      anyDrone = true
     end
   end
-  if not any then
-    clear(row); term.setCursor(P3 + 1, row)
-    gpu.setForeground(0xFF4444); io.write("  [ NO DRONES IN STOCK ]")
-    row = row + 1
-  end
-
-  row = row + 1
-
-  -- Drill kits (a "kit" = one drill tip + one rod of the same material).
-  clear(row); term.setCursor(P3 + 1, row)
-  gpu.setForeground(0x888888); io.write("  DRILL KITS IN STOCK:")
-  row = row + 1
+  if not anyDrone then put("  [ NO DRONES IN STOCK ]", 0xFF4444) end
+  skip(1)
+  put("  DRILL KITS IN STOCK:", 0x888888)
   local anyDrill = false
   for _, key in ipairs(drillKeyOrder) do
     local d = brokerState.drills[key]
     local kits = (d and d.kits) or 0
     if kits > 0 then
-      if row > H then break end
-      clear(row); term.setCursor(P3 + 1, row)
-      gpu.setForeground(0x00AAFF)
-      -- Display the material name, stripped of " Drill Tip".
       local entry = config.drills[key]
-      local name = (entry and entry.tip and entry.tip:gsub(" Drill Tip", "")) or key
-      io.write(string.format("  %-18s  x%d", name, kits))
-      row = row + 1; anyDrill = true
+      local name = (entry and entry.tip and
+        entry.tip:gsub(" Drill Tip", "")) or key
+      put(string.format("  %-18s  x%d", name, kits), 0x00AAFF)
+      anyDrill = true
     end
   end
-  if not anyDrill then
-    if row <= H then
-      clear(row); term.setCursor(P3 + 1, row)
-      gpu.setForeground(0xFF4444); io.write("  [ NO DRILL KITS IN STOCK ]")
-      row = row + 1
-    end
-  end
-
-  for r = row, H do clear(r) end
+  if not anyDrill then put("  [ NO DRILL KITS IN STOCK ]", 0xFF4444) end
+  paintPanel(P3 + 1, lines, panelCache.hw)
 end
-
 local function drawStaticFrame()
   if not gpu then return end
   term.clear()
@@ -738,6 +675,8 @@ local function drawStaticFrame()
   term.setCursor(P1 + 1, 4); io.write("MODULES")
   term.setCursor(P2 + 1, 4); io.write("DUST STOCK")
   term.setCursor(P3 + 1, 4); io.write("HARDWARE")
+  term.setCursor(2, 3); gpu.setForeground(0x888888)
+  io.write("F10: safe stop / return bus items     R: refresh screen")
   gpu.setForeground(0x555555)
   for y = 6, H do
     term.setCursor(P1, y); io.write("|")
@@ -747,8 +686,13 @@ end
 
 local function drawUI()
   if not gpu then return end
-  term.setCursor(W - 17, 2); gpu.setForeground(0x555555)
-  io.write("SYNC: " .. os.date("%H:%M:%S", math.floor(getUnixTime())) .. "   ")
+  local syncText = "SYNC: " .. os.date("%H:%M:%S", math.floor(getUnixTime()))
+  if syncText ~= lastSyncText then
+    gpu.setBackground(0x000000)
+    gpu.setForeground(0x555555)
+    gpu.set(W - 17, 2, (syncText .. string.rep(" ", 18)):sub(1, 18))
+    lastSyncText = syncText
+  end
   drawModulePanel(); drawDustPanel(); drawHWPanel()
 end
 
@@ -808,6 +752,159 @@ local function initModules()
   end
 end
 
+-- Safe-stop key (F10): stop mining, allow current loader tasks to settle,
+-- then recover input-bus items to ME. No new jobs are dispatched after F10.
+local function gracefulShutdown()
+  logger:info("[SHUTDOWN] F10 requested; no further dispatch")
+  if gpu then
+    term.clear()
+    gpu.setForeground(0xFFFFFF)
+  end
+  print("MEDINA SAFE STOP")
+  print("Disabling all mining modules...")
+
+  local disabled = {}
+  local warnings = {}
+  local function warn(s)
+    warnings[#warnings + 1] = s
+    logger:error("[SHUTDOWN] " .. s)
+    print("WARNING: " .. s)
+  end
+
+  -- Never pull a drone from a machine that is still allowed to start a recipe.
+  for _, mod in ipairs(modules) do
+    local ok, err = pcall(mod.adapter.setWorkAllowed, false)
+    disabled[mod.index] = ok and err ~= false
+    if not disabled[mod.index] then
+      warn("M" .. mod.index .. " disable failed: " .. tostring(err))
+    end
+  end
+
+  -- The loader has no cancellation API. Finish its cooperative tasks without
+  -- calling pollLoad() (which would otherwise re-enable mining on success).
+  print("Waiting for active item loaders...")
+  local loadDeadline = computer.uptime() + 90
+  while sched.busy() and computer.uptime() < loadDeadline do
+    sched.tick()
+    os.sleep(0.05)
+  end
+  if sched.busy() then
+    warn("Loader timeout: recovery skipped to avoid racing item transfers")
+    print("Modules are disabled where possible; check remaining input buses.")
+    return false
+  end
+
+  -- The module may finish an in-progress mining recipe even after work is
+  -- disabled. Wait for it to become inactive before touching its input bus.
+  local allReturned = true
+  for _, mod in ipairs(modules) do
+    local prefix = "M" .. mod.index
+    if not disabled[mod.index] then
+      allReturned = false
+      warn(prefix .. " skipped (not confirmed disabled)")
+    else
+      print(prefix .. ": waiting for mining cycle to finish...")
+      local idle = false
+      local deadline = computer.uptime() + 180
+      while computer.uptime() < deadline do
+        local ok, active = pcall(mod.adapter.isMachineActive)
+        if not ok then
+          warn(prefix .. " active state unreadable: " .. tostring(active))
+          break
+        end
+        if not active then idle = true; break end
+        os.sleep(0.25)
+      end
+      if not idle then
+        allReturned = false
+        warn(prefix .. " still active or unknown; bus left untouched")
+      else
+        -- Stop the ME interface from restocking items during recovery.
+        local clearOK, clearErr = pcall(clearInterfaceSlots, mod)
+        if not clearOK then
+          allReturned = false
+          warn(prefix .. " ME stocking config could not clear: " .. tostring(clearErr))
+        else
+          -- Empty EVERY slot, not just the drone/tip/rod slots. Retry until
+          -- the interface has room to accept the items or we time out.
+          local returned = false
+          local transferDeadline = computer.uptime() + 30
+          while computer.uptime() < transferDeadline do
+            local ok, result = pcall(function()
+              local count = mod.transposer.getInventorySize(mod.conf.inputBusSide)
+              if not count then error("input bus not accessible") end
+              for slot = 1, count do
+                local qty = mod.transposer.getSlotStackSize(
+                  mod.conf.inputBusSide, slot) or 0
+                if qty > 0 then
+                  mod.transposer.transferItem(
+                    mod.conf.inputBusSide, mod.conf.interfaceSide, qty, slot)
+                end
+              end
+              for slot = 1, count do
+                if (mod.transposer.getSlotStackSize(
+                    mod.conf.inputBusSide, slot) or 0) > 0 then
+                  return false
+                end
+              end
+              return true
+            end)
+            if not ok then
+              warn(prefix .. " bus recovery error: " .. tostring(result))
+              break
+            end
+            if result then returned = true; break end
+            os.sleep(0.5)
+          end
+          if not returned then
+            allReturned = false
+            warn(prefix .. " still has items in its input bus; check ME interface space")
+          else
+            -- The interface is a buffer; wait briefly for returned items to
+            -- actually drain into ME before claiming successful recovery.
+            local drained = false
+            local drainDeadline = computer.uptime() + 20
+            while computer.uptime() < drainDeadline do
+              local ok, empty = pcall(function()
+                local count = mod.transposer.getInventorySize(mod.conf.interfaceSide)
+                if not count then error("interface buffer not accessible") end
+                for slot = 1, count do
+                  if (mod.transposer.getSlotStackSize(
+                      mod.conf.interfaceSide, slot) or 0) > 0 then
+                    return false
+                  end
+                end
+                return true
+              end)
+              if not ok then
+                warn(prefix .. " cannot verify ME interface drain: " .. tostring(empty))
+                break
+              end
+              if empty then drained = true; break end
+              os.sleep(0.5)
+            end
+            if not drained then
+              allReturned = false
+              warn(prefix .. " bus empty, but items remain/unverified in ME interface")
+            else
+              print(prefix .. ": input bus returned and ME interface drained")
+            end
+          end
+        end
+      end
+    end
+  end
+  if allReturned then
+    print("SAFE STOP COMPLETE: all accessible input buses recovered.")
+    logger:info("[SHUTDOWN] all modules recovered")
+  else
+    print("SAFE STOP PARTIAL: inspect warnings and module inventories.")
+    logger:error("[SHUTDOWN] some modules need manual recovery")
+  end
+  print("Broker stopped; returning to the OpenOS shell.")
+  return allReturned
+end
+
 -- =============================================================================
 -- MAIN LOOP
 -- =============================================================================
@@ -836,8 +933,16 @@ while true do
   -- 1. Service one inbound message. Very short timeout: returns immediately if a
   --    message is waiting, otherwise yields the CPU for ~10ms and comes back so
   --    the scheduler keeps ticking fast.
-  local ev = { event.pull(0.01, "modem_message") }
-  if ev[1] == "modem_message" then processMessage(table.unpack(ev)) end
+  local ev = { event.pull(0.01) }
+  if ev[1] == "key_down" and ev[4] == keyboard.keys.f10 then
+    gracefulShutdown()
+    break
+  elseif ev[1] == "key_down" and ev[4] == keyboard.keys.r then
+    invalidatePanelCache()
+    drawStaticFrame()
+  elseif ev[1] == "modem_message" then
+    processMessage(table.unpack(ev))
+  end
 
   -- 2. Advance every in-flight load task. This is the hot path — runs every
   --    iteration so concurrent loads progress as fast as the hardware allows.
